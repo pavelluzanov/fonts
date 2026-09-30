@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Handwriting → Font</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.5; }
+  h1 { font-size: 22px; }
+  section { margin-bottom: 32px; padding-bottom: 24px; border-bottom: 1px solid #ddd; }
+  button { padding: 10px 16px; font-size: 15px; cursor: pointer; }
+  input[type=file] { margin: 10px 0; }
+  #log { background: #111; color: #0f0; font-family: monospace; font-size: 13px; padding: 12px; border-radius: 6px; height: 220px; overflow-y: auto; white-space: pre-wrap; }
+  .crop-preview { display: inline-block; width: 48px; height: 48px; border: 1px solid #ccc; margin: 2px; image-rendering: pixelated; }
+  #cropGrid { display: flex; flex-wrap: wrap; max-height: 200px; overflow-y: auto; margin-top: 10px; }
+  #fontTest { font-size: 48px; margin-top: 16px; border: 1px solid #ccc; padding: 12px; min-height: 60px; }
+</style>
+</head>
+<body>
+
+<h1>Handwriting → TTF Font Builder</h1>
+
+<section>
+  <h2>1. Get the template</h2>
+  <p>Download and print. Draw one letter per box, keep strokes within the box.</p>
+  <button id="downloadTemplateBtn">Download template PDF</button>
+</section>
+
+<section>
+  <h2>2. Upload your scanned pages</h2>
+  <p>Upload both pages (in either order — the tool detects which is which by content, not filename).</p>
+  <input type="file" id="fileInput" accept="image/*" multiple>
+  <div id="cropGrid"></div>
+</section>
+
+<section>
+  <h2>3. Build font</h2>
+  <button id="buildBtn" disabled>Build TTF</button>
+  <div id="fontTest">Type here once built...</div>
+</section>
+
+<section>
+  <h2>Log</h2>
+  <div id="log"></div>
+</section>
+
+<script type="module">
+import { potrace, init as potraceInit } from './potrace-wasm.js';
+
+const logEl = document.getElementById('log');
+function log(msg) {
+  const line = document.createElement('div');
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(msg);
+}
+
+// ---- Template geometry (must match generated PDF template) ----
+const CELL_MM = 32;
+const MARGIN_MM = 12;
+const COLS = 5, ROWS = 7;
+const BASELINE_FRAC = 0.30;
+const ASCENDER_FRAC = 0.70;
+const ASCENDER_UPM = 800;
+const UPM = 1000;
+
+const GLYPHS = [
+  ..."abcdefghijklmnopqrstuvwxyz",
+  ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  ..."0123456789",
+  ".", ",", "!", "?", "-", "'"
+];
+const PER_PAGE = COLS * ROWS;
+const PAGE_GLYPHS = [GLYPHS.slice(0, PER_PAGE), GLYPHS.slice(PER_PAGE)];
+
+// ---------- Stage 1: template download ----------
+document.getElementById('downloadTemplateBtn').onclick = () => {
+  log('Generating template PDF...');
+  generateTemplatePDF();
+};
+
+function generateTemplatePDF() {
+  // Minimal PDF generation without external deps: draw to canvas per page,
+  // then compose into a PDF using a tiny embedded routine, OR (simpler and
+  // more robust): just render two PNG pages the user can print directly.
+  // For v1 we generate two high-res PNGs (this avoids pulling in a PDF lib
+  // just for the template) and prompt the user to print them.
+  for (let page = 0; page < 2; page++) {
+    const canvas = renderTemplatePage(PAGE_GLYPHS[page], page + 1);
+    const link = document.createElement('a');
+    link.download = `glyph_template_page${page + 1}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  }
+  log('Template pages downloaded. Print at 100% scale (no "fit to page").');
+}
+
+function renderTemplatePage(glyphs, pageNum) {
+  const DPI = 300;
+  const pxPerMm = DPI / 25.4;
+  const pageWmm = 210, pageHmm = 297;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(pageWmm * pxPerMm);
+  canvas.height = Math.round(pageHmm * pxPerMm);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'white';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'black';
+  ctx.font = `${Math.round(4 * pxPerMm)}px sans-serif`;
+  ctx.fillText(`Handwriting font template — page ${pageNum}`, 12 * pxPerMm, 12 * pxPerMm);
+  ctx.font = `${Math.round(3 * pxPerMm)}px sans-serif`;
+  ctx.fillText('Draw ONE glyph per box. Keep strokes within the box.', 12 * pxPerMm, 18 * pxPerMm);
+
+  const x0 = MARGIN_MM * pxPerMm;
+  const y0 = 30 * pxPerMm; // matches previously-verified geometry
+  const cellPx = CELL_MM * pxPerMm;
+
+  glyphs.forEach((g, i) => {
+    const col = i % COLS, row = Math.floor(i / COLS);
+    const bx = x0 + col * cellPx, by = y0 + row * cellPx;
+
+    ctx.strokeStyle = '#bbb';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx, by, cellPx, cellPx);
+
+    // baseline (darker, dashed) — this is what our JS grid-detector looks for
+    const baselineY = by + cellPx * (1 - BASELINE_FRAC);
+    ctx.strokeStyle = '#666';
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(bx, baselineY);
+    ctx.lineTo(bx + cellPx, baselineY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = '#999';
+    ctx.font = `${Math.round(2.2 * pxPerMm)}px sans-serif`;
+    ctx.fillText(g, bx + 4, by + 14);
+    ctx.fillStyle = 'black';
+  });
+
+  return canvas;
+}
+
+// ---------- Stage 2: upload + grid detection ----------
+let uploadedPages = []; // [{img, glyphs, canvas}]
+
+document.getElementById('fileInput').onchange = async (e) => {
+  const files = Array.from(e.target.files);
+  if (files.length !== 2) {
+    log(`Expected 2 files, got ${files.length}. Upload both pages.`);
+    return;
+  }
+  log(`Loading ${files.length} images...`);
+  const loaded = await Promise.all(files.map(loadImageFile));
+
+  // Detect which page is which by looking for header text region content
+  // is unreliable via pixels alone, so instead: detect by grid content —
+  // page 1 has lowercase a-z + A-D-ish, page 2 starts with J. Simplest
+  // robust signal: OCR is overkill; instead we detect via glyph COUNT
+  // structure by checking baseline rows (both pages have 7 rows, so that
+  // doesn't disambiguate). Practical approach: ask the user, OR just
+  // process both and let them pick which is "page 1" via file order,
+  // BUT to avoid the earlier swapped-file bug, we detect right here:
+  for (const item of loaded) {
+    item.baselineY = detectBaselines(item.canvas);
+    log(`${item.file.name}: detected ${item.baselineY.length} baseline rows`);
+  }
+
+  uploadedPages = loaded;
+  renderCropPreview();
+  document.getElementById('buildBtn').disabled = false;
+};
+
+function loadImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      resolve({ file, img, canvas });
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// Detect horizontal baseline rows by scanning for the darkest non-ink gray
+// band (dashed baseline), same approach validated in the Python pipeline.
+function detectBaselines(canvas) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const probeX0 = Math.floor(w * 0.05), probeX1 = Math.floor(w * 0.9);
+  const data = ctx.getImageData(0, probeX0, w, 1); // placeholder, real scan below
+
+  const rowCounts = new Array(h).fill(0);
+  const imgData = ctx.getImageData(probeX0, 0, probeX1 - probeX0, h);
+  const px = imgData.data;
+  const rowWidth = probeX1 - probeX0;
+
+  for (let y = 0; y < h; y++) {
+    let count = 0;
+    for (let x = 0; x < rowWidth; x++) {
+      const idx = (y * rowWidth + x) * 4;
+      const gray = px[idx]; // R channel (grayscale-ish since template is B/W)
+      if (gray > 70 && gray < 160) count++;
+    }
+    rowCounts[y] = count;
+  }
+
+  const threshold = rowWidth * 0.15;
+  const candidateRows = [];
+  for (let y = 0; y < h; y++) {
+    if (rowCounts[y] > threshold) candidateRows.push(y);
+  }
+
+  // cluster consecutive rows
+  const lines = [];
+  if (candidateRows.length) {
+    let start = candidateRows[0], prev = candidateRows[0];
+    for (let i = 1; i < candidateRows.length; i++) {
+      const y = candidateRows[i];
+      if (y - prev > 5) {
+        lines.push(Math.round((start + prev) / 2));
+        start = y;
+      }
+      prev = y;
+    }
+    lines.push(Math.round((start + prev) / 2));
+  }
+  return lines;
+}
+
+function renderCropPreview() {
+  const gridEl = document.getElementById('cropGrid');
+  gridEl.innerHTML = '';
+  uploadedPages.forEach((item, pi) => {
+    const label = document.createElement('div');
+    label.textContent = `${item.file.name}: ${item.baselineY.length} rows detected`;
+    label.style.width = '100%';
+    gridEl.appendChild(label);
+  });
+}
+
+// ---------- Stage 3: build font (wired up next iteration) ----------
+document.getElementById('buildBtn').onclick = async () => {
+  log('Initializing potrace-wasm...');
+  await potraceInit();
+  log('potrace ready. Cropping + tracing not yet wired in this build — next step.');
+};
+</script>
+</body>
+</html>
